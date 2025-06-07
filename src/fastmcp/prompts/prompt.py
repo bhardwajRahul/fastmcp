@@ -59,7 +59,7 @@ class PromptArgument(FastMCPBaseModel):
 
     name: str = Field(description="Name of the argument")
     description: str | None = Field(
-        None, description="Description of what the argument does"
+        default=None, description="Description of what the argument does"
     )
     required: bool = Field(
         default=False, description="Whether the argument is required"
@@ -71,13 +71,13 @@ class Prompt(FastMCPBaseModel, ABC):
 
     name: str = Field(description="Name of the prompt")
     description: str | None = Field(
-        None, description="Description of what the prompt does"
+        default=None, description="Description of what the prompt does"
     )
     tags: Annotated[set[str], BeforeValidator(_convert_set_defaults)] = Field(
         default_factory=set, description="Tags for the prompt"
     )
     arguments: list[PromptArgument] | None = Field(
-        None, description="Arguments that can be passed to the prompt"
+        default=None, description="Arguments that can be passed to the prompt"
     )
 
     def __eq__(self, other: object) -> bool:
@@ -171,6 +171,9 @@ class FunctionPrompt(Prompt):
         # if the fn is a callable class, we need to get the __call__ method from here out
         if not inspect.isroutine(fn):
             fn = fn.__call__
+        # if the fn is a staticmethod, we need to work with the underlying function
+        if isinstance(fn, staticmethod):
+            fn = fn.__func__
 
         type_adapter = get_cached_typeadapter(fn)
         parameters = type_adapter.json_schema()

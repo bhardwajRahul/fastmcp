@@ -45,14 +45,14 @@ class Tool(FastMCPBaseModel, ABC):
         default_factory=set, description="Tags for the tool"
     )
     annotations: ToolAnnotations | None = Field(
-        None, description="Additional annotations about the tool"
+        default=None, description="Additional annotations about the tool"
     )
     exclude_args: list[str] | None = Field(
-        None,
+        default=None,
         description="Arguments to exclude from the tool schema, such as State, Memory, or Credential",
     )
     serializer: Callable[[Any], str] | None = Field(
-        None, description="Optional custom serializer for tool results"
+        default=None, description="Optional custom serializer for tool results"
     )
 
     def to_mcp_tool(self, **overrides: Any) -> MCPTool:
@@ -146,6 +146,9 @@ class FunctionTool(Tool):
         # if the fn is a callable class, we need to get the __call__ method from here out
         if not inspect.isroutine(fn):
             fn = fn.__call__
+        # if the fn is a staticmethod, we need to work with the underlying function
+        if isinstance(fn, staticmethod):
+            fn = fn.__func__
 
         type_adapter = get_cached_typeadapter(fn)
         schema = type_adapter.json_schema()

@@ -14,7 +14,7 @@ from contextlib import (
 )
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Literal
+from typing import TYPE_CHECKING, Any, Generic, Literal, overload
 
 import anyio
 import httpx
@@ -45,6 +45,7 @@ import fastmcp.server
 import fastmcp.settings
 from fastmcp.exceptions import NotFoundError
 from fastmcp.prompts import Prompt, PromptManager
+from fastmcp.prompts.prompt import FunctionPrompt
 from fastmcp.resources import Resource, ResourceManager
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.auth.auth import OAuthProvider
@@ -55,9 +56,8 @@ from fastmcp.server.http import (
     create_streamable_http_app,
 )
 from fastmcp.tools import ToolManager
-from fastmcp.tools.tool import Tool
+from fastmcp.tools.tool import FunctionTool, Tool
 from fastmcp.utilities.cache import TimedCache
-from fastmcp.utilities.decorators import DecoratedFunction
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.mcp_config import MCPConfig
 
@@ -490,11 +490,7 @@ class FastMCP(Generic[LifespanResultT]):
         with the Context type annotation. See the @tool decorator for examples.
 
         Args:
-            fn: The function to register as a tool
-            name: Optional name for the tool (defaults to function name)
-            description: Optional description of what the tool does
-            tags: Optional set of tags for categorizing the tool
-            annotations: Optional annotations about the tool's behavior
+            tool: The Tool instance to register
         """
         self._tool_manager.add_tool(tool)
         self._cache.clear()
@@ -511,6 +507,30 @@ class FastMCP(Generic[LifespanResultT]):
         self._tool_manager.remove_tool(name)
         self._cache.clear()
 
+    @overload
+    def tool(
+        self,
+        name_or_fn: AnyFunction,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+        annotations: ToolAnnotations | dict[str, Any] | None = None,
+        exclude_args: list[str] | None = None,
+    ) -> FunctionTool: ...
+
+    @overload
+    def tool(
+        self,
+        name_or_fn: str | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+        annotations: ToolAnnotations | dict[str, Any] | None = None,
+        exclude_args: list[str] | None = None,
+    ) -> Callable[[AnyFunction], FunctionTool]: ...
+
     def tool(
         self,
         name_or_fn: str | AnyFunction | None = None,
@@ -520,7 +540,7 @@ class FastMCP(Generic[LifespanResultT]):
         tags: set[str] | None = None,
         annotations: ToolAnnotations | dict[str, Any] | None = None,
         exclude_args: list[str] | None = None,
-    ) -> Callable[[AnyFunction], AnyFunction] | AnyFunction:
+    ) -> Callable[[AnyFunction], FunctionTool] | FunctionTool:
         """Decorator to register a tool.
 
         Tools can optionally request a Context object by adding a parameter with the
@@ -565,14 +585,26 @@ class FastMCP(Generic[LifespanResultT]):
         if isinstance(annotations, dict):
             annotations = ToolAnnotations(**annotations)
 
+        if isinstance(name_or_fn, classmethod):
+            raise ValueError(
+                inspect.cleandoc(
+                    """
+                    To decorate a classmethod, first define the method and then call
+                    tool() directly on the method instead of using it as a
+                    decorator. See https://gofastmcp.com/patterns/decorating-methods
+                    for examples and more information.
+                    """
+                )
+            )
+
         # Determine the actual name and function based on the calling pattern
-        if callable(name_or_fn):
+        if inspect.isroutine(name_or_fn):
             # Case 1: @tool (without parens) - function passed directly
             # Case 2: direct call like tool(fn, name="something")
             fn = name_or_fn
             tool_name = name  # Use keyword name if provided, otherwise None
 
-            # Register the tool immediately and return the function
+            # Register the tool immediately and return the tool object
             tool = Tool.from_function(
                 fn,
                 name=tool_name,
@@ -583,7 +615,7 @@ class FastMCP(Generic[LifespanResultT]):
                 serializer=self._tool_serializer,
             )
             self.add_tool(tool)
-            return fn
+            return tool
 
         elif isinstance(name_or_fn, str):
             # Case 3: @tool("custom_name") - name passed as first argument
@@ -675,7 +707,7 @@ class FastMCP(Generic[LifespanResultT]):
         description: str | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
-    ) -> Callable[[AnyFunction], AnyFunction]:
+    ) -> Callable[[AnyFunction], Resource | ResourceTemplate]:
         """Decorator to register a function as a resource.
 
         The function will be called when the resource is read to generate its content.
@@ -723,14 +755,26 @@ class FastMCP(Generic[LifespanResultT]):
                 return f"Weather for {city}: {data}"
         """
         # Check if user passed function directly instead of calling decorator
-        if callable(uri):
+        if inspect.isroutine(uri):
             raise TypeError(
                 "The @resource decorator was used incorrectly. "
                 "Did you forget to call it? Use @resource('uri') instead of @resource"
             )
 
-        def decorator(fn: AnyFunction) -> AnyFunction:
+        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate:
             from fastmcp.server.context import Context
+
+            if isinstance(fn, classmethod):  # type: ignore[reportUnnecessaryIsInstance]
+                raise ValueError(
+                    inspect.cleandoc(
+                        """
+                        To decorate a classmethod, first define the method and then call
+                        resource() directly on the method instead of using it as a
+                        decorator. See https://gofastmcp.com/patterns/decorating-methods
+                        for examples and more information.
+                        """
+                    )
+                )
 
             # Check if this should be a template
             has_uri_params = "{" in uri and "}" in uri
@@ -751,6 +795,7 @@ class FastMCP(Generic[LifespanResultT]):
                     tags=tags,
                 )
                 self.add_template(template)
+                return template
             elif not has_uri_params and not has_func_params:
                 resource = Resource.from_function(
                     fn=fn,
@@ -761,13 +806,12 @@ class FastMCP(Generic[LifespanResultT]):
                     tags=tags,
                 )
                 self.add_resource(resource)
+                return resource
             else:
                 raise ValueError(
                     "Invalid resource or template definition due to a "
                     "mismatch between URI parameters and function parameters."
                 )
-
-            return fn
 
         return decorator
 
@@ -780,6 +824,26 @@ class FastMCP(Generic[LifespanResultT]):
         self._prompt_manager.add_prompt(prompt)
         self._cache.clear()
 
+    @overload
+    def prompt(
+        self,
+        name_or_fn: AnyFunction,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+    ) -> FunctionPrompt: ...
+
+    @overload
+    def prompt(
+        self,
+        name_or_fn: str | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        tags: set[str] | None = None,
+    ) -> Callable[[AnyFunction], FunctionPrompt]: ...
+
     def prompt(
         self,
         name_or_fn: str | AnyFunction | None = None,
@@ -787,7 +851,7 @@ class FastMCP(Generic[LifespanResultT]):
         name: str | None = None,
         description: str | None = None,
         tags: set[str] | None = None,
-    ) -> Callable[[AnyFunction], AnyFunction] | AnyFunction:
+    ) -> Callable[[AnyFunction], FunctionPrompt] | FunctionPrompt:
         """Decorator to register a prompt.
 
         Prompts can optionally request a Context object by adding a parameter with the
@@ -852,8 +916,21 @@ class FastMCP(Generic[LifespanResultT]):
             # Direct function call
             server.prompt(my_function, name="custom_name")
         """
+
+        if isinstance(name_or_fn, classmethod):
+            raise ValueError(
+                inspect.cleandoc(
+                    """
+                    To decorate a classmethod, first define the method and then call
+                    prompt() directly on the method instead of using it as a
+                    decorator. See https://gofastmcp.com/patterns/decorating-methods
+                    for examples and more information.
+                    """
+                )
+            )
+
         # Determine the actual name and function based on the calling pattern
-        if callable(name_or_fn):
+        if inspect.isroutine(name_or_fn):
             # Case 1: @prompt (without parens) - function passed directly as decorator
             # Case 2: direct call like prompt(fn, name="something")
             fn = name_or_fn
@@ -868,12 +945,7 @@ class FastMCP(Generic[LifespanResultT]):
             )
             self.add_prompt(prompt)
 
-            # If name is provided, this is a direct call, return original function for consistency with tools
-            # If name is None, this is @prompt without parens, return DecoratedFunction for proper method handling
-            if name is not None:
-                return fn  # Direct function call
-            else:
-                return DecoratedFunction(fn)  # Decorator usage
+            return prompt
 
         elif isinstance(name_or_fn, str):
             # Case 3: @prompt("custom_name") - name passed as first argument
