@@ -19,11 +19,10 @@ async def test_tool_exclude_args_in_tool_manager():
             pass
         return message
 
-    tools = mcp._tool_manager.list_tools()
+    tools_dict = await mcp._tool_manager.get_tools()
+    tools = list(tools_dict.values())
     assert len(tools) == 1
-    assert tools[0].exclude_args is not None
-    for args in tools[0].exclude_args:
-        assert args not in tools[0].parameters
+    assert "state" not in tools[0].parameters["properties"]
 
 
 async def test_tool_exclude_args_without_default_value_raises_error():
@@ -62,12 +61,10 @@ async def test_add_tool_method_exclude_args():
     mcp.add_tool(tool)
 
     # Check internal tool objects directly
-    tools = mcp._tool_manager.list_tools()
+    tools_dict = await mcp._tool_manager.get_tools()
+    tools = list(tools_dict.values())
     assert len(tools) == 1
-    assert tools[0].exclude_args is not None
-    assert tools[0].exclude_args == ["state"]
-    for args in tools[0].exclude_args:
-        assert args not in tools[0].parameters
+    assert "state" not in tools[0].parameters["properties"]
 
 
 async def test_tool_functionality_with_exclude_args():

@@ -6,10 +6,9 @@ from pydantic import Field
 
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import NotFoundError
-from fastmcp.prompts.prompt import Prompt
+from fastmcp.prompts.prompt import FunctionPrompt, Prompt
 from fastmcp.resources import Resource, ResourceTemplate
 from fastmcp.server.server import (
-    MountedServer,
     add_resource_prefix,
     has_resource_prefix,
     remove_resource_prefix,
@@ -179,7 +178,6 @@ class TestToolDecorator:
             def __init__(self, x: int):
                 self.x = x
 
-            @mcp.tool
             def add(self, y: int) -> int:
                 return self.x + y
 
@@ -206,8 +204,8 @@ class TestToolDecorator:
         mcp = FastMCP()
 
         class MyClass:
-            @staticmethod
             @mcp.tool
+            @staticmethod
             def add(x: int, y: int) -> int:
                 return x + y
 
@@ -223,6 +221,17 @@ class TestToolDecorator:
 
         result = await mcp._mcp_call_tool("add", {"x": 1, "y": 2})
         assert result[0].text == "3"  # type: ignore[attr-defined]
+
+    async def test_tool_decorator_classmethod_error(self):
+        mcp = FastMCP()
+
+        with pytest.raises(ValueError, match="To decorate a classmethod"):
+
+            class MyClass:
+                @mcp.tool
+                @classmethod
+                def add(cls, y: int) -> None:
+                    pass
 
     async def test_tool_decorator_classmethod_async_function(self):
         mcp = FastMCP()
@@ -250,6 +259,20 @@ class TestToolDecorator:
         result = await mcp._mcp_call_tool("add", {"x": 1, "y": 2})
         assert result[0].text == "3"  # type: ignore[attr-defined]
 
+    async def test_tool_decorator_staticmethod_order(self):
+        """Test that the recommended decorator order works for static methods"""
+        mcp = FastMCP()
+
+        class MyClass:
+            @mcp.tool
+            @staticmethod
+            def add_v1(x: int, y: int) -> int:
+                return x + y
+
+        # Test that the recommended order works
+        result = await mcp._mcp_call_tool("add_v1", {"x": 1, "y": 2})
+        assert result[0].text == "3"  # type: ignore[attr-defined]
+
     async def test_tool_decorator_with_tags(self):
         """Test that the tool decorator properly sets tags."""
         mcp = FastMCP()
@@ -259,7 +282,7 @@ class TestToolDecorator:
             return x * 2
 
         # Verify the tags were set correctly
-        tools = mcp._tool_manager.list_tools()
+        tools = await mcp._tool_manager.list_tools()
         assert len(tools) == 1
         assert tools[0].tags == {"example", "test-tag"}
 
@@ -326,11 +349,11 @@ class TestToolDecorator:
         result_fn = mcp.tool(standalone_function, name="direct_call_tool")
 
         # The function should be returned unchanged
-        assert result_fn is standalone_function
+        assert isinstance(result_fn, FunctionTool)
 
         # Verify the tool was registered correctly
         tools = await mcp.get_tools()
-        assert "direct_call_tool" in tools
+        assert tools["direct_call_tool"] is result_fn
 
         # Verify it can be called
         result = await mcp._mcp_call_tool("direct_call_tool", {"x": 5, "y": 3})
@@ -481,12 +504,23 @@ class TestResourceDecorator:
             result = await client.read_resource("resource://data")
             assert result[0].text == "Class prefix: Hello, world!"  # type: ignore[attr-defined]
 
+    async def test_resource_decorator_classmethod_error(self):
+        mcp = FastMCP()
+
+        with pytest.raises(ValueError, match="To decorate a classmethod"):
+
+            class MyClass:
+                @mcp.resource("resource://data")
+                @classmethod
+                def get_data(cls) -> None:
+                    pass
+
     async def test_resource_decorator_staticmethod(self):
         mcp = FastMCP()
 
         class MyClass:
-            @staticmethod
             @mcp.resource("resource://data")
+            @staticmethod
             def get_data() -> str:
                 return "Static Hello, world!"
 
@@ -504,6 +538,20 @@ class TestResourceDecorator:
         async with Client(mcp) as client:
             result = await client.read_resource("resource://data")
             assert result[0].text == "Async Hello, world!"  # type: ignore[attr-defined]
+
+    async def test_resource_decorator_staticmethod_order(self):
+        """Test that both decorator orders work for static methods"""
+        mcp = FastMCP()
+
+        class MyClass:
+            @mcp.resource("resource://data")  # type: ignore[misc]  # Type checker warns but runtime works
+            @staticmethod
+            def get_data() -> str:
+                return "Static Hello, world!"
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("resource://data")
+            assert result[0].text == "Static Hello, world!"  # type: ignore[attr-defined]
 
 
 class TestTemplateDecorator:
@@ -610,8 +658,8 @@ class TestTemplateDecorator:
         mcp = FastMCP()
 
         class MyClass:
-            @staticmethod
             @mcp.resource("resource://{name}/data")
+            @staticmethod
             def get_data(name: str) -> str:
                 return f"Static Data for {name}"
 
@@ -784,12 +832,23 @@ class TestPromptDecorator:
             message = result.messages[0]
             assert message.content.text == "Class prefix: Hello, world!"  # type: ignore[attr-defined]
 
+    async def test_prompt_decorator_classmethod_error(self):
+        mcp = FastMCP()
+
+        with pytest.raises(ValueError, match="To decorate a classmethod"):
+
+            class MyClass:
+                @mcp.prompt
+                @classmethod
+                def test_prompt(cls) -> None:
+                    pass
+
     async def test_prompt_decorator_staticmethod(self):
         mcp = FastMCP()
 
         class MyClass:
-            @staticmethod
             @mcp.prompt
+            @staticmethod
             def test_prompt() -> str:
                 return "Static Hello, world!"
 
@@ -857,11 +916,11 @@ class TestPromptDecorator:
         result_fn = mcp.prompt(standalone_function, name="direct_call_prompt")
 
         # The function should be returned unchanged
-        assert result_fn is standalone_function
+        assert isinstance(result_fn, FunctionPrompt)
 
         # Verify the prompt was registered correctly
         prompts = await mcp.get_prompts()
-        assert "direct_call_prompt" in prompts
+        assert prompts["direct_call_prompt"] is result_fn
 
         # Verify it can be called
         async with Client(mcp) as client:
@@ -881,6 +940,22 @@ class TestPromptDecorator:
             @mcp.prompt("positional_name", name="keyword_name")
             def my_function() -> str:
                 return "Hello, world!"
+
+    async def test_prompt_decorator_staticmethod_order(self):
+        """Test that both decorator orders work for static methods"""
+        mcp = FastMCP()
+
+        class MyClass:
+            @mcp.prompt  # type: ignore[misc]  # Type checker warns but runtime works
+            @staticmethod
+            def test_prompt() -> str:
+                return "Static Hello, world!"
+
+        async with Client(mcp) as client:
+            result = await client.get_prompt("test_prompt")
+            assert len(result.messages) == 1
+            message = result.messages[0]
+            assert message.content.text == "Static Hello, world!"  # type: ignore[attr-defined]
 
 
 class TestResourcePrefixHelpers:
@@ -1050,7 +1125,7 @@ class TestResourcePrefixMounting:
 
         # Create a main server and mount the resource server
         main_server = FastMCP(name="MainServer")
-        main_server.mount("prefix", server)
+        main_server.mount(server, "prefix")
 
         # Check that the resources are mounted with the correct prefixes
         resources = await main_server.get_resources()
@@ -1107,16 +1182,23 @@ class TestResourcePrefixMounting:
     async def test_mounted_server_matching_and_stripping(
         self, uri, prefix, expected_match, expected_strip
     ):
-        """Test that MountedServer correctly matches and strips resource prefixes."""
-        # Create a basic server to mount
+        """Test that resource prefix utility functions correctly match and strip resource prefixes."""
+        from fastmcp.server.server import has_resource_prefix, remove_resource_prefix
+
+        # Create a basic server to get the default resource prefix format
         server = FastMCP()
-        mounted = MountedServer(prefix=prefix, server=server)
 
         # Test matching
-        assert mounted.match_resource(uri) == expected_match
+        assert (
+            has_resource_prefix(uri, prefix, server.resource_prefix_format)
+            == expected_match
+        )
 
         # Test stripping
-        assert mounted.strip_resource_prefix(uri) == expected_strip
+        assert (
+            remove_resource_prefix(uri, prefix, server.resource_prefix_format)
+            == expected_strip
+        )
 
     async def test_import_server_with_new_prefix_format(self):
         """Test that import_server correctly uses the new prefix format."""
@@ -1137,7 +1219,7 @@ class TestResourcePrefixMounting:
 
         # Create target server and import the source server
         target_server = FastMCP(name="TargetServer")
-        await target_server.import_server("imported", source_server)
+        await target_server.import_server(source_server, "imported")
 
         # Check that the resources were imported with the correct prefixes
         resources = await target_server.get_resources()
@@ -1159,3 +1241,106 @@ class TestResourcePrefixMounting:
                 "resource://imported/param-value/template"
             )
             assert result[0].text == "Template resource with param-value"  # type: ignore[attr-defined]
+
+
+class TestShouldIncludeComponent:
+    def test_no_filters_returns_true(self):
+        """Test that when no include or exclude filters are provided, always returns True."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2"}, parameters={})
+        mcp = FastMCP(tools=[tool])
+        result = mcp._should_enable_component(tool)
+        assert result is True
+
+    def test_exclude_string_tag_present_returns_false(self):
+        """Test that when an exclude string tag is present in tags, returns False."""
+        tool = Tool(
+            name="test_tool", tags={"tag1", "tag2", "exclude_me"}, parameters={}
+        )
+        mcp = FastMCP(tools=[tool], exclude_tags={"exclude_me"})
+        result = mcp._should_enable_component(tool)
+        assert result is False
+
+    def test_exclude_string_tag_absent_returns_true(self):
+        """Test that when an exclude string tag is not present in tags, returns True."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2"}, parameters={})
+        mcp = FastMCP(tools=[tool], exclude_tags={"exclude_me"})
+        result = mcp._should_enable_component(tool)
+        assert result is True
+
+    def test_multiple_exclude_tags_any_match_returns_false(self):
+        """Test that when any exclude tag matches, returns False."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2", "tag3"}, parameters={})
+        mcp = FastMCP(
+            tools=[tool], exclude_tags={"not_present", "tag2", "also_not_present"}
+        )
+        result = mcp._should_enable_component(tool)
+        assert result is False
+
+    def test_include_string_tag_present_returns_true(self):
+        """Test that when an include string tag is present in tags, returns True."""
+        tool = Tool(
+            name="test_tool", tags={"tag1", "include_me", "tag2"}, parameters={}
+        )
+        mcp = FastMCP(tools=[tool], include_tags={"include_me"})
+        result = mcp._should_enable_component(tool)
+        assert result is True
+
+    def test_include_string_tag_absent_returns_false(self):
+        """Test that when an include string tag is not present in tags, returns False."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2"}, parameters={})
+        mcp = FastMCP(tools=[tool], include_tags={"include_me"})
+        result = mcp._should_enable_component(tool)
+        assert result is False
+
+    def test_multiple_include_tags_any_match_returns_true(self):
+        """Test that when any include tag matches, returns True."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2", "tag3"}, parameters={})
+        mcp = FastMCP(
+            tools=[tool], include_tags={"not_present", "tag2", "also_not_present"}
+        )
+        result = mcp._should_enable_component(tool)
+        assert result is True
+
+    def test_multiple_include_tags_none_match_returns_false(self):
+        """Test that when no include tags match, returns False."""
+        tool = Tool(name="test_tool", tags={"tag1", "tag2", "tag3"}, parameters={})
+        mcp = FastMCP(tools=[tool], include_tags={"not_present", "also_not_present"})
+        result = mcp._should_enable_component(tool)
+        assert result is False
+
+    def test_exclude_takes_precedence_over_include(self):
+        """Test that exclude tags take precedence over include tags."""
+        tool = Tool(
+            name="test_tool", tags={"tag1", "tag2", "exclude_me"}, parameters={}
+        )
+        mcp = FastMCP(tools=[tool], include_tags={"tag1"}, exclude_tags={"exclude_me"})
+        result = mcp._should_enable_component(tool)
+        assert result is False
+
+    def test_empty_include_exclude_sets(self):
+        """Test behavior with empty include/exclude sets."""
+        # Empty include set means nothing matches
+        tool1 = Tool(name="test_tool", tags={"tag1", "tag2"}, parameters={})
+        mcp1 = FastMCP(tools=[tool1], include_tags=set())
+        result = mcp1._should_enable_component(tool1)
+        assert result is False
+
+        # Empty exclude set means nothing excluded
+        tool2 = Tool(name="test_tool", tags={"tag1", "tag2"}, parameters={})
+        mcp2 = FastMCP(tools=[tool2], exclude_tags=set())
+        result = mcp2._should_enable_component(tool2)
+        assert result is True
+
+    def test_empty_tags_with_filters(self):
+        """Test behavior when input tags are empty."""
+        # With include filters, empty tags should not match
+        tool1 = Tool(name="test_tool", tags=set(), parameters={})
+        mcp1 = FastMCP(tools=[tool1], include_tags={"required_tag"})
+        result = mcp1._should_enable_component(tool1)
+        assert result is False
+
+        # With exclude filters but no include, empty tags should pass
+        tool2 = Tool(name="test_tool", tags=set(), parameters={})
+        mcp2 = FastMCP(tools=[tool2], exclude_tags={"bad_tag"})
+        result = mcp2._should_enable_component(tool2)
+        assert result is True
