@@ -5,23 +5,21 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Callable
-from typing import Annotated, Any
+from typing import Any
 from urllib.parse import unquote
 
 from mcp.types import ResourceTemplate as MCPResourceTemplate
 from pydantic import (
-    BeforeValidator,
     Field,
     field_validator,
     validate_call,
 )
 
-from fastmcp.resources.types import Resource
+from fastmcp.resources.resource import Resource
 from fastmcp.server.dependencies import get_context
+from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.types import (
-    FastMCPBaseModel,
-    _convert_set_defaults,
     find_kwarg_by_type,
     get_cached_typeadapter,
 )
@@ -51,16 +49,11 @@ def match_uri_template(uri: str, uri_template: str) -> dict[str, str] | None:
     return None
 
 
-class ResourceTemplate(FastMCPBaseModel):
+class ResourceTemplate(FastMCPComponent):
     """A template for dynamically creating resources."""
 
     uri_template: str = Field(
         description="URI template with parameters (e.g. weather://{city}/current)"
-    )
-    name: str = Field(description="Name of the resource")
-    description: str | None = Field(description="Description of what the resource does")
-    tags: Annotated[set[str], BeforeValidator(_convert_set_defaults)] = Field(
-        default_factory=set, description="Tags for the resource"
     )
     mime_type: str = Field(
         default="text/plain", description="MIME type of the resource content"
@@ -69,22 +62,45 @@ class ResourceTemplate(FastMCPBaseModel):
         description="JSON schema for function parameters"
     )
 
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(uri_template={self.uri_template!r}, name={self.name!r}, description={self.description!r}, tags={self.tags})"
+
+    def enable(self) -> None:
+        super().enable()
+        try:
+            context = get_context()
+            context._queue_resource_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
+    def disable(self) -> None:
+        super().disable()
+        try:
+            context = get_context()
+            context._queue_resource_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
     @staticmethod
     def from_function(
         fn: Callable[..., Any],
         uri_template: str,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
+        enabled: bool | None = None,
     ) -> FunctionResourceTemplate:
         return FunctionResourceTemplate.from_function(
             fn=fn,
             uri_template=uri_template,
             name=name,
+            title=title,
             description=description,
             mime_type=mime_type,
             tags=tags,
+            enabled=enabled,
         )
 
     @field_validator("mime_type", mode="before")
@@ -120,13 +136,8 @@ class ResourceTemplate(FastMCPBaseModel):
             description=self.description,
             mime_type=self.mime_type,
             tags=self.tags,
+            enabled=self.enabled,
         )
-
-    def __eq__(self, other: object) -> bool:
-        if type(self) is not type(other):
-            return False
-        assert isinstance(other, type(self))
-        return self.model_dump() == other.model_dump()
 
     def to_mcp_template(self, **overrides: Any) -> MCPResourceTemplate:
         """Convert the resource template to an MCPResourceTemplate."""
@@ -135,8 +146,32 @@ class ResourceTemplate(FastMCPBaseModel):
             "name": self.name,
             "description": self.description,
             "mimeType": self.mime_type,
+            "title": self.title,
         }
         return MCPResourceTemplate(**kwargs | overrides)
+
+    @classmethod
+    def from_mcp_template(cls, mcp_template: MCPResourceTemplate) -> ResourceTemplate:
+        """Creates a FastMCP ResourceTemplate from a raw MCP ResourceTemplate object."""
+        # Note: This creates a simple ResourceTemplate instance. For function-based templates,
+        # the original function is lost, which is expected for remote templates.
+        return cls(
+            uri_template=mcp_template.uriTemplate,
+            name=mcp_template.name,
+            description=mcp_template.description,
+            mime_type=mcp_template.mimeType or "text/plain",
+            parameters={},  # Remote templates don't have local parameters
+        )
+
+    @property
+    def key(self) -> str:
+        """
+        The key of the component. This is used for internal bookkeeping
+        and may reflect e.g. prefixes or other identifiers. You should not depend on
+        keys having a certain value, as the same tool loaded from different
+        hierarchies of servers may have different keys.
+        """
+        return self._key or self.uri_template
 
 
 class FunctionResourceTemplate(ResourceTemplate):
@@ -165,9 +200,11 @@ class FunctionResourceTemplate(ResourceTemplate):
         fn: Callable[..., Any],
         uri_template: str,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
+        enabled: bool | None = None,
     ) -> FunctionResourceTemplate:
         """Create a template from a function."""
         from fastmcp.server.context import Context
@@ -223,10 +260,14 @@ class FunctionResourceTemplate(ResourceTemplate):
                     f"URI parameters {uri_params} must be a subset of the function arguments: {func_params}"
                 )
 
-        description = description or fn.__doc__
+        description = description or inspect.getdoc(fn)
 
+        # if the fn is a callable class, we need to get the __call__ method from here out
         if not inspect.isroutine(fn):
             fn = fn.__call__
+        # if the fn is a staticmethod, we need to work with the underlying function
+        if isinstance(fn, staticmethod):
+            fn = fn.__func__
 
         type_adapter = get_cached_typeadapter(fn)
         parameters = type_adapter.json_schema()
@@ -241,9 +282,11 @@ class FunctionResourceTemplate(ResourceTemplate):
         return cls(
             uri_template=uri_template,
             name=func_name,
+            title=title,
             description=description,
             mime_type=mime_type or "text/plain",
             fn=fn,
             parameters=parameters,
             tags=tags or set(),
+            enabled=enabled if enabled is not None else True,
         )
