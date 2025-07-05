@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import multiprocessing
 import socket
 import time
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import uvicorn
 
-from fastmcp.settings import settings
+from fastmcp import settings
 from fastmcp.utilities.http import find_available_port
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 @contextmanager
 def temporary_settings(**kwargs: Any):
     """
-    Temporarily override ControlFlow setting values.
+    Temporarily override FastMCP setting values.
 
     Args:
         **kwargs: The settings to override, including nested settings.
@@ -32,8 +33,8 @@ def temporary_settings(**kwargs: Any):
         from fastmcp.utilities.tests import temporary_settings
 
         with temporary_settings(log_level='DEBUG'):
-            assert fastmcp.settings.settings.log_level == 'DEBUG'
-        assert fastmcp.settings.settings.log_level == 'INFO'
+            assert fastmcp.settings.log_level == 'DEBUG'
+        assert fastmcp.settings.log_level == 'INFO'
         ```
     """
     old_settings = copy.deepcopy(settings.model_dump())
@@ -129,3 +130,15 @@ def run_server_in_process(
         proc.join(timeout=2)
         if proc.is_alive():
             raise RuntimeError("Server process failed to terminate even after kill")
+
+
+@contextmanager
+def caplog_for_fastmcp(caplog):
+    """Context manager to capture logs from FastMCP loggers even when propagation is disabled."""
+    caplog.clear()
+    logger = logging.getLogger("FastMCP")
+    logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(caplog.handler)
