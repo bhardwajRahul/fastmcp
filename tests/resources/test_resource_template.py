@@ -405,6 +405,7 @@ class TestMatchUriTemplate:
             ("test://a/b/c", None),
             ("test://a/x/b", {"x": "x"}),
             ("test://a/x/y/b", None),
+            ("test://a/1-2/b", {"x": "1-2"}),
         ],
     )
     def test_match_uri_template_single_param(
@@ -558,6 +559,47 @@ class TestMatchUriTemplate:
         result = match_uri_template(uri=uri, uri_template=uri_template)
         assert result == expected_params
 
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("resource://test_foo", {"x": "foo"}),
+            ("resource://test_bar", {"x": "bar"}),
+            ("resource://test_hello", {"x": "hello"}),
+            ("resource://test_with_underscores", {"x": "with_underscores"}),
+            ("resource://test_", None),  # Empty parameter not matched
+            ("resource://test", None),  # Missing parameter delimiter
+            ("resource://other_foo", None),  # Wrong prefix
+            ("other://test_foo", None),  # Wrong scheme
+        ],
+    )
+    def test_match_uri_template_embedded_param(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs where parameter is embedded within a word segment."""
+        uri_template = "resource://test_{x}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("resource://prefix_foo_suffix", {"x": "foo"}),
+            ("resource://prefix_bar_suffix", {"x": "bar"}),
+            ("resource://prefix_hello_world_suffix", {"x": "hello_world"}),
+            ("resource://prefix__suffix", None),  # Empty parameter not matched
+            ("resource://prefix_suffix", None),  # Missing parameter delimiter
+            ("resource://other_foo_suffix", None),  # Wrong prefix
+            ("resource://prefix_foo_other", None),  # Wrong suffix
+        ],
+    )
+    def test_match_uri_template_embedded_param_with_prefix_and_suffix(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs where parameter has both prefix and suffix."""
+        uri_template = "resource://prefix_{x}_suffix"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
 
 class TestContextHandling:
     """Test context handling in resource templates."""
@@ -628,7 +670,7 @@ class TestContextHandling:
         mcp = FastMCP()
         context = Context(fastmcp=mcp)
 
-        with context:
+        async with context:
             resource = await template.create_resource(
                 "test://42",
                 {"x": 42},
@@ -656,7 +698,7 @@ class TestContextHandling:
         mcp = FastMCP()
         context = Context(fastmcp=mcp)
 
-        with context:
+        async with context:
             resource = await template.create_resource(
                 "test://42",
                 {"x": 42},

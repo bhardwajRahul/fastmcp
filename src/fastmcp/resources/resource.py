@@ -11,18 +11,17 @@ import pydantic_core
 from mcp.types import Resource as MCPResource
 from pydantic import (
     AnyUrl,
-    BeforeValidator,
     ConfigDict,
     Field,
     UrlConstraints,
-    ValidationInfo,
     field_validator,
+    model_validator,
 )
+from typing_extensions import Self
 
 from fastmcp.server.dependencies import get_context
+from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.types import (
-    FastMCPBaseModel,
-    _convert_set_defaults,
     find_kwarg_by_type,
 )
 
@@ -30,7 +29,7 @@ if TYPE_CHECKING:
     pass
 
 
-class Resource(FastMCPBaseModel, abc.ABC):
+class Resource(FastMCPComponent, abc.ABC):
     """Base class for all resources."""
 
     model_config = ConfigDict(validate_default=True)
@@ -38,35 +37,49 @@ class Resource(FastMCPBaseModel, abc.ABC):
     uri: Annotated[AnyUrl, UrlConstraints(host_required=False)] = Field(
         default=..., description="URI of the resource"
     )
-    name: str | None = Field(description="Name of the resource", default=None)
-    description: str | None = Field(
-        description="Description of the resource", default=None
-    )
-    tags: Annotated[set[str], BeforeValidator(_convert_set_defaults)] = Field(
-        default_factory=set, description="Tags for the resource"
-    )
+    name: str = Field(default="", description="Name of the resource")
     mime_type: str = Field(
         default="text/plain",
         description="MIME type of the resource content",
         pattern=r"^[a-zA-Z0-9]+/[a-zA-Z0-9\-+.]+$",
     )
 
+    def enable(self) -> None:
+        super().enable()
+        try:
+            context = get_context()
+            context._queue_resource_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
+    def disable(self) -> None:
+        super().disable()
+        try:
+            context = get_context()
+            context._queue_resource_list_changed()  # type: ignore[private-use]
+        except RuntimeError:
+            pass  # No context available
+
     @staticmethod
     def from_function(
-        fn: Callable[[], Any],
+        fn: Callable[..., Any],
         uri: str | AnyUrl,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
+        enabled: bool | None = None,
     ) -> FunctionResource:
         return FunctionResource.from_function(
             fn=fn,
             uri=uri,
             name=name,
+            title=title,
             description=description,
             mime_type=mime_type,
             tags=tags,
+            enabled=enabled,
         )
 
     @field_validator("mime_type", mode="before")
@@ -77,26 +90,21 @@ class Resource(FastMCPBaseModel, abc.ABC):
             return mime_type
         return "text/plain"
 
-    @field_validator("name", mode="before")
-    @classmethod
-    def set_default_name(cls, name: str | None, info: ValidationInfo) -> str:
+    @model_validator(mode="after")
+    def set_default_name(self) -> Self:
         """Set default name from URI if not provided."""
-        if name:
-            return name
-        if uri := info.data.get("uri"):
-            return str(uri)
-        raise ValueError("Either name or uri must be provided")
+        if self.name:
+            pass
+        elif self.uri:
+            self.name = str(self.uri)
+        else:
+            raise ValueError("Either name or uri must be provided")
+        return self
 
     @abc.abstractmethod
     async def read(self) -> str | bytes:
         """Read the resource content."""
         pass
-
-    def __eq__(self, other: object) -> bool:
-        if type(self) is not type(other):
-            return False
-        assert isinstance(other, type(self))
-        return self.model_dump() == other.model_dump()
 
     def to_mcp_resource(self, **overrides: Any) -> MCPResource:
         """Convert the resource to an MCPResource."""
@@ -105,8 +113,22 @@ class Resource(FastMCPBaseModel, abc.ABC):
             "name": self.name,
             "description": self.description,
             "mimeType": self.mime_type,
+            "title": self.title,
         }
         return MCPResource(**kwargs | overrides)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(uri={self.uri!r}, name={self.name!r}, description={self.description!r}, tags={self.tags})"
+
+    @property
+    def key(self) -> str:
+        """
+        The key of the component. This is used for internal bookkeeping
+        and may reflect e.g. prefixes or other identifiers. You should not depend on
+        keys having a certain value, as the same tool loaded from different
+        hierarchies of servers may have different keys.
+        """
+        return self._key or str(self.uri)
 
 
 class FunctionResource(Resource):
@@ -122,17 +144,19 @@ class FunctionResource(Resource):
     - other types will be converted to JSON
     """
 
-    fn: Callable[[], Any]
+    fn: Callable[..., Any]
 
     @classmethod
     def from_function(
         cls,
-        fn: Callable[[], Any],
+        fn: Callable[..., Any],
         uri: str | AnyUrl,
         name: str | None = None,
+        title: str | None = None,
         description: str | None = None,
         mime_type: str | None = None,
         tags: set[str] | None = None,
+        enabled: bool | None = None,
     ) -> FunctionResource:
         """Create a FunctionResource from a function."""
         if isinstance(uri, str):
@@ -141,9 +165,11 @@ class FunctionResource(Resource):
             fn=fn,
             uri=uri,
             name=name or fn.__name__,
-            description=description or fn.__doc__,
+            title=title,
+            description=description or inspect.getdoc(fn),
             mime_type=mime_type or "text/plain",
             tags=tags or set(),
+            enabled=enabled if enabled is not None else True,
         )
 
     async def read(self) -> str | bytes:
@@ -156,7 +182,7 @@ class FunctionResource(Resource):
             kwargs[context_kwarg] = get_context()
 
         result = self.fn(**kwargs)
-        if inspect.iscoroutinefunction(self.fn):
+        if inspect.isawaitable(result):
             result = await result
 
         if isinstance(result, Resource):
@@ -166,4 +192,4 @@ class FunctionResource(Resource):
         elif isinstance(result, str):
             return result
         else:
-            return pydantic_core.to_json(result, fallback=str, indent=2).decode()
+            return pydantic_core.to_json(result, fallback=str).decode()

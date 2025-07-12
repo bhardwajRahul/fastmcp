@@ -13,19 +13,23 @@ from re import Pattern
 from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
-from mcp.types import EmbeddedResource, ImageContent, TextContent, ToolAnnotations
+from mcp.types import ToolAnnotations
 from pydantic.networks import AnyUrl
 
+import fastmcp
 from fastmcp.exceptions import ToolError
 from fastmcp.resources import Resource, ResourceTemplate
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.server.server import FastMCP
-from fastmcp.tools.tool import Tool, _convert_to_content
+from fastmcp.tools.tool import Tool, ToolResult
 from fastmcp.utilities import openapi
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.openapi import (
     HTTPRoute,
     _combine_schemas,
+    extract_output_schema_from_responses,
+    format_array_parameter,
+    format_deep_object_parameter,
     format_description_with_responses,
 )
 
@@ -103,41 +107,56 @@ class RouteType(enum.Enum):
     IGNORE = "IGNORE"
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RouteMap:
     """Mapping configuration for HTTP routes to FastMCP component types."""
 
     methods: list[HttpMethod] | Literal["*"] = field(default="*")
     pattern: Pattern[str] | str = field(default=r".*")
-    mcp_type: MCPType | None = field(default=None)
     route_type: RouteType | MCPType | None = field(default=None)
-    tags: set[str] = field(default_factory=set)
+    tags: set[str] = field(
+        default_factory=set,
+        metadata={"description": "A set of tags to match. All tags must match."},
+    )
+    mcp_type: MCPType | None = field(
+        default=None,
+        metadata={"description": "The type of FastMCP component to create."},
+    )
+    mcp_tags: set[str] = field(
+        default_factory=set,
+        metadata={
+            "description": "A set of tags to apply to the generated FastMCP component."
+        },
+    )
 
     def __post_init__(self):
         """Validate and process the route map after initialization."""
         # Handle backward compatibility for route_type, deprecated in 2.5.0
         if self.mcp_type is None and self.route_type is not None:
-            warnings.warn(
-                "The 'route_type' parameter is deprecated and will be removed in a future version. "
-                "Use 'mcp_type' instead with the appropriate MCPType value.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if isinstance(self.route_type, RouteType):
+            if fastmcp.settings.deprecation_warnings:
                 warnings.warn(
-                    "The RouteType class is deprecated and will be removed in a future version. "
-                    "Use MCPType instead.",
+                    "The 'route_type' parameter is deprecated and will be removed in a future version. "
+                    "Use 'mcp_type' instead with the appropriate MCPType value.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
+            if isinstance(self.route_type, RouteType):
+                if fastmcp.settings.deprecation_warnings:
+                    warnings.warn(
+                        "The RouteType class is deprecated and will be removed in a future version. "
+                        "Use MCPType instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
             # Check for the deprecated IGNORE value
             if self.route_type == RouteType.IGNORE:
-                warnings.warn(
-                    "RouteType.IGNORE is deprecated and will be removed in a future version. "
-                    "Use MCPType.EXCLUDE instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+                if fastmcp.settings.deprecation_warnings:
+                    warnings.warn(
+                        "RouteType.IGNORE is deprecated and will be removed in a future version. "
+                        "Use MCPType.EXCLUDE instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
 
             # Convert from RouteType to MCPType if needed
             if isinstance(self.route_type, RouteType):
@@ -155,23 +174,17 @@ class RouteMap:
             self.route_type = self.mcp_type
 
 
-# Default route mappings as a list, where order determines priority
+# Default route mapping: all routes become tools.
+# Users can provide custom route_maps to override this behavior.
 DEFAULT_ROUTE_MAPPINGS = [
-    # GET requests with path parameters go to ResourceTemplate
-    RouteMap(
-        methods=["GET"], pattern=r".*\{.*\}.*", mcp_type=MCPType.RESOURCE_TEMPLATE
-    ),
-    # GET requests without path parameters go to Resource
-    RouteMap(methods=["GET"], pattern=r".*", mcp_type=MCPType.RESOURCE),
-    # All other HTTP methods go to Tool
-    RouteMap(methods="*", pattern=r".*", mcp_type=MCPType.TOOL),
+    RouteMap(mcp_type=MCPType.TOOL),
 ]
 
 
 def _determine_route_type(
     route: openapi.HTTPRoute,
     mappings: list[RouteMap],
-) -> MCPType:
+) -> RouteMap:
     """
     Determines the FastMCP component type based on the route and mappings.
 
@@ -180,7 +193,7 @@ def _determine_route_type(
         mappings: List of RouteMap objects in priority order
 
     Returns:
-        MCPType for this route
+        The RouteMap that matches the route, or a catchall "Tool" RouteMap if no match is found.
     """
     # Check mappings in priority order (first match wins)
     for route_map in mappings:
@@ -207,10 +220,10 @@ def _determine_route_type(
                 logger.debug(
                     f"Route {route.method} {route.path} matched mapping to {route_map.mcp_type.name}"
                 )
-                return route_map.mcp_type
+                return route_map
 
     # Default fallback
-    return MCPType.TOOL
+    return RouteMap(mcp_type=MCPType.TOOL)
 
 
 class OpenAPITool(Tool):
@@ -223,19 +236,19 @@ class OpenAPITool(Tool):
         name: str,
         description: str,
         parameters: dict[str, Any],
-        tags: set[str] = set(),
+        output_schema: dict[str, Any] | None = None,
+        tags: set[str] | None = None,
         timeout: float | None = None,
         annotations: ToolAnnotations | None = None,
-        exclude_args: list[str] | None = None,
         serializer: Callable[[Any], str] | None = None,
     ):
         super().__init__(
             name=name,
             description=description,
             parameters=parameters,
-            tags=tags,
+            output_schema=output_schema,
+            tags=tags or set(),
             annotations=annotations,
-            exclude_args=exclude_args,
             serializer=serializer,
         )
         self._client = client
@@ -246,24 +259,48 @@ class OpenAPITool(Tool):
         """Custom representation to prevent recursion errors when printing."""
         return f"OpenAPITool(name={self.name!r}, method={self._route.method}, path={self._route.path})"
 
-    async def run(
-        self, arguments: dict[str, Any]
-    ) -> list[TextContent | ImageContent | EmbeddedResource]:
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
         """Execute the HTTP request based on the route configuration."""
+
+        # Create mapping from suffixed parameter names back to original names and locations
+        # This handles parameter collisions where suffixes were added during schema generation
+        param_mapping = {}  # suffixed_name -> (original_name, location)
+
+        # First, check if we have request body properties to detect collisions
+        body_props = set()
+        if self._route.request_body and self._route.request_body.content_schema:
+            content_type = next(iter(self._route.request_body.content_schema))
+            body_schema = self._route.request_body.content_schema[content_type]
+            body_props = set(body_schema.get("properties", {}).keys())
+
+        # Build parameter mapping for potentially suffixed parameters
+        for param in self._route.parameters:
+            original_name = param.name
+            suffixed_name = f"{param.name}__{param.location}"
+
+            # If parameter name collides with body property, it would have been suffixed
+            if param.name in body_props:
+                param_mapping[suffixed_name] = (original_name, param.location)
+            # Also map original name for backward compatibility when no collision
+            param_mapping[original_name] = (original_name, param.location)
 
         # Prepare URL
         path = self._route.path
 
-        # Replace path parameters with values from kwargs
-        # Path parameters should never be None as they're typically required
-        # but we'll handle that case anyway
-        path_params = {
-            p.name: arguments.get(p.name)
-            for p in self._route.parameters
-            if p.location == "path"
-            and p.name in arguments
-            and arguments.get(p.name) is not None
-        }
+        # Replace path parameters with values from arguments
+        # Look for both original and suffixed parameter names
+        path_params = {}
+        for p in self._route.parameters:
+            if p.location == "path":
+                # Try suffixed name first, then original name
+                suffixed_name = f"{p.name}__{p.location}"
+                if (
+                    suffixed_name in arguments
+                    and arguments.get(suffixed_name) is not None
+                ):
+                    path_params[p.name] = arguments[suffixed_name]
+                elif p.name in arguments and arguments.get(p.name) is not None:
+                    path_params[p.name] = arguments[p.name]
 
         # Ensure all path parameters are provided
         required_path_params = {
@@ -290,46 +327,10 @@ class OpenAPITool(Tool):
                 if is_array:
                     # Format array values as comma-separated string
                     # This follows the OpenAPI 'simple' style (default for path)
-                    if all(
-                        isinstance(item, str | int | float | bool)
-                        for item in param_value
-                    ):
-                        # Handle simple array types
-                        path = path.replace(
-                            f"{{{param_name}}}", ",".join(str(v) for v in param_value)
-                        )
-                    else:
-                        # Handle complex array types (containing objects/dicts)
-                        try:
-                            # Try to create a simple representation without Python syntax artifacts
-                            formatted_parts = []
-                            for item in param_value:
-                                if isinstance(item, dict):
-                                    # For objects, serialize key-value pairs
-                                    item_parts = []
-                                    for k, v in item.items():
-                                        item_parts.append(f"{k}:{v}")
-                                    formatted_parts.append(".".join(item_parts))
-                                else:
-                                    # Fallback for other complex types
-                                    formatted_parts.append(str(item))
-
-                            # Join parts with commas
-                            formatted_value = ",".join(formatted_parts)
-                            path = path.replace(f"{{{param_name}}}", formatted_value)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to format complex array path parameter '{param_name}': {e}"
-                            )
-                            # Fallback to string representation, but remove Python syntax artifacts
-                            str_value = (
-                                str(param_value)
-                                .replace("[", "")
-                                .replace("]", "")
-                                .replace("'", "")
-                                .replace('"', "")
-                            )
-                            path = path.replace(f"{{{param_name}}}", str_value)
+                    formatted_value = format_array_parameter(
+                        param_value, param_name, is_query_parameter=False
+                    )
+                    path = path.replace(f"{{{param_name}}}", str(formatted_value))
                     continue
 
             # Default handling for non-array parameters or non-array schemas
@@ -338,58 +339,82 @@ class OpenAPITool(Tool):
         # Prepare query parameters - filter out None and empty strings
         query_params = {}
         for p in self._route.parameters:
-            if (
-                p.location == "query"
-                and p.name in arguments
-                and arguments.get(p.name) is not None
-                and arguments.get(p.name) != ""
-            ):
-                param_value = arguments.get(p.name)
+            if p.location == "query":
+                # Try suffixed name first, then original name
+                suffixed_name = f"{p.name}__{p.location}"
+                param_value = None
 
-                # Format array query parameters as comma-separated strings
-                # following OpenAPI form style (default for query parameters)
-                if isinstance(param_value, list) and p.schema_.get("type") == "array":
-                    # Get explode parameter from schema, default is True for query parameters
-                    # If explode is True, the array is serialized as separate parameters
-                    # If explode is False, the array is serialized as a comma-separated string
-                    explode = p.schema_.get("explode", True)
-
-                    if explode:
-                        # When explode=True, we pass the array directly, which HTTPX will serialize
-                        # as multiple parameters with the same name
-                        query_params[p.name] = param_value
-                    else:
-                        # For arrays of simple types (strings, numbers, etc.), join with commas
-                        if all(
-                            isinstance(item, str | int | float | bool)
-                            for item in param_value
-                        ):
-                            query_params[p.name] = ",".join(str(v) for v in param_value)
-                        else:
-                            # For complex types, try to create a simpler representation
-                            try:
-                                # Try to create a simple string representation
-                                formatted_parts = []
-                                for item in param_value:
-                                    if isinstance(item, dict):
-                                        # For objects, serialize key-value pairs
-                                        item_parts = []
-                                        for k, v in item.items():
-                                            item_parts.append(f"{k}:{v}")
-                                        formatted_parts.append(".".join(item_parts))
-                                    else:
-                                        formatted_parts.append(str(item))
-
-                                query_params[p.name] = ",".join(formatted_parts)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to format complex array query parameter '{p.name}': {e}"
-                                )
-                                # Fallback to string representation
-                                query_params[p.name] = param_value
+                suffixed_value = arguments.get(suffixed_name)
+                if (
+                    suffixed_name in arguments
+                    and suffixed_value is not None
+                    and suffixed_value != ""
+                    and not (
+                        isinstance(suffixed_value, list | dict)
+                        and len(suffixed_value) == 0
+                    )
+                ):
+                    param_value = arguments[suffixed_name]
                 else:
-                    # Non-array parameters are passed as is
-                    query_params[p.name] = param_value
+                    name_value = arguments.get(p.name)
+                    if (
+                        p.name in arguments
+                        and name_value is not None
+                        and name_value != ""
+                        and not (
+                            isinstance(name_value, list | dict) and len(name_value) == 0
+                        )
+                    ):
+                        param_value = arguments[p.name]
+
+                if param_value is not None:
+                    # Handle different parameter styles and types
+                    param_style = (
+                        p.style or "form"
+                    )  # Default style for query parameters is "form"
+                    param_explode = (
+                        p.explode if p.explode is not None else True
+                    )  # Default explode for query is True
+
+                    # Handle deepObject style for object parameters
+                    if (
+                        param_style == "deepObject"
+                        and isinstance(param_value, dict)
+                        and len(param_value) > 0
+                    ):
+                        if param_explode:
+                            # deepObject with explode=true: object properties become separate parameters
+                            # e.g., target[id]=123&target[type]=user
+                            deep_obj_params = format_deep_object_parameter(
+                                param_value, p.name
+                            )
+                            query_params.update(deep_obj_params)
+                        else:
+                            # deepObject with explode=false is not commonly used, fallback to JSON
+                            logger.warning(
+                                f"deepObject style with explode=false for parameter '{p.name}' is not standard. "
+                                f"Using JSON serialization fallback."
+                            )
+                            query_params[p.name] = json.dumps(param_value)
+                    # Handle array parameters with form style (default)
+                    elif (
+                        isinstance(param_value, list)
+                        and p.schema_.get("type") == "array"
+                        and len(param_value) > 0
+                    ):
+                        if param_explode:
+                            # When explode=True, we pass the array directly, which HTTPX will serialize
+                            # as multiple parameters with the same name
+                            query_params[p.name] = param_value
+                        else:
+                            # Format array as comma-separated string when explode=False
+                            formatted_value = format_array_parameter(
+                                param_value, p.name, is_query_parameter=True
+                            )
+                            query_params[p.name] = formatted_value
+                    else:
+                        # Non-array, non-deepObject parameters are passed as is
+                        query_params[p.name] = param_value
 
         # Prepare headers - fix typing by ensuring all values are strings
         headers = {}
@@ -397,12 +422,21 @@ class OpenAPITool(Tool):
         # Start with OpenAPI-defined header parameters
         openapi_headers = {}
         for p in self._route.parameters:
-            if (
-                p.location == "header"
-                and p.name in arguments
-                and arguments[p.name] is not None
-            ):
-                openapi_headers[p.name.lower()] = str(arguments[p.name])
+            if p.location == "header":
+                # Try suffixed name first, then original name
+                suffixed_name = f"{p.name}__{p.location}"
+                param_value = None
+
+                if (
+                    suffixed_name in arguments
+                    and arguments.get(suffixed_name) is not None
+                ):
+                    param_value = arguments[suffixed_name]
+                elif p.name in arguments and arguments.get(p.name) is not None:
+                    param_value = arguments[p.name]
+
+                if param_value is not None:
+                    openapi_headers[p.name.lower()] = str(param_value)
         headers.update(openapi_headers)
 
         # Add headers from the current MCP client HTTP request (these take precedence)
@@ -412,16 +446,22 @@ class OpenAPITool(Tool):
         # Prepare request body
         json_data = None
         if self._route.request_body and self._route.request_body.content_schema:
-            # Extract body parameters, excluding path/query/header params that were already used
-            path_query_header_params = {
-                p.name
-                for p in self._route.parameters
-                if p.location in ("path", "query", "header")
-            }
+            # Extract body parameters with collision-aware logic
+            # Exclude all parameter names that belong to path/query/header locations
+            params_to_exclude = set()
+
+            for p in self._route.parameters:
+                if (
+                    p.name in body_props
+                ):  # This parameter had a collision, so it was suffixed
+                    params_to_exclude.add(f"{p.name}__{p.location}")
+                else:  # No collision, parameter keeps original name but should still be excluded from body
+                    params_to_exclude.add(p.name)
+
             body_params = {
                 k: v
                 for k, v in arguments.items()
-                if k not in path_query_header_params and k != "context"
+                if k not in params_to_exclude and k != "context"
             }
 
             if body_params:
@@ -444,10 +484,24 @@ class OpenAPITool(Tool):
             # Try to parse as JSON first
             try:
                 result = response.json()
-            except (json.JSONDecodeError, ValueError):
-                # Return text content if not JSON
-                result = response.text
-            return _convert_to_content(result)
+
+                # Handle structured content based on output schema, if any
+                structured_output = None
+                if self.output_schema is not None:
+                    if self.output_schema.get("x-fastmcp-wrap-result"):
+                        # Schema says wrap - always wrap in result key
+                        structured_output = {"result": result}
+                    else:
+                        structured_output = result
+                # If no output schema, use fallback logic for backward compatibility
+                elif not isinstance(result, dict):
+                    structured_output = {"result": result}
+                else:
+                    structured_output = result
+
+                return ToolResult(structured_content=structured_output)
+            except json.JSONDecodeError:
+                return ToolResult(content=response.text)
 
         except httpx.HTTPStatusError as e:
             # Handle HTTP errors (4xx, 5xx)
@@ -688,6 +742,7 @@ class FastMCPOpenAPI(FastMCP):
         route_map_fn: RouteMapFn | None = None,
         mcp_component_fn: ComponentFn | None = None,
         mcp_names: dict[str, str] | None = None,
+        tags: set[str] | None = None,
         timeout: float | None = None,
         **settings: Any,
     ):
@@ -710,6 +765,8 @@ class FastMCPOpenAPI(FastMCP):
                 operationId up to the first double underscore. If no operationId exists,
                 falls back to slugified summary or path-based naming.
                 All names are truncated to 56 characters maximum.
+            tags: Optional set of tags to add to all components. Components always receive any tags
+                from the route.
             timeout: Optional timeout (in seconds) for all requests
             **settings: Additional settings for FastMCP
         """
@@ -717,9 +774,7 @@ class FastMCPOpenAPI(FastMCP):
 
         self._client = client
         self._timeout = timeout
-        self._route_map_fn = route_map_fn
         self._mcp_component_fn = mcp_component_fn
-        self._mcp_names = mcp_names or {}
 
         # Keep track of names to detect collisions
         self._used_names = {
@@ -735,12 +790,16 @@ class FastMCPOpenAPI(FastMCP):
         route_maps = (route_maps or []) + DEFAULT_ROUTE_MAPPINGS
         for route in http_routes:
             # Determine route type based on mappings or default rules
-            route_type = _determine_route_type(route, route_maps)
+            route_map = _determine_route_type(route, route_maps)
+
+            # TODO: remove this once RouteType is removed and mcp_type is typed as MCPType without | None
+            assert route_map.mcp_type is not None
+            route_type = route_map.mcp_type
 
             # Call route_map_fn if provided
-            if self._route_map_fn is not None:
+            if route_map_fn is not None:
                 try:
-                    result = self._route_map_fn(route, route_type)
+                    result = route_map_fn(route, route_type)
                     if result is not None:
                         route_type = result
                         logger.debug(
@@ -754,29 +813,32 @@ class FastMCPOpenAPI(FastMCP):
                     )
 
             # Generate a default name from the route
-            component_name = self._generate_default_name(route, route_type)
+            component_name = self._generate_default_name(route, mcp_names)
+
+            route_tags = set(route.tags) | route_map.mcp_tags | (tags or set())
 
             if route_type == MCPType.TOOL:
-                self._create_openapi_tool(route, component_name)
+                self._create_openapi_tool(route, component_name, tags=route_tags)
             elif route_type == MCPType.RESOURCE:
-                self._create_openapi_resource(route, component_name)
+                self._create_openapi_resource(route, component_name, tags=route_tags)
             elif route_type == MCPType.RESOURCE_TEMPLATE:
-                self._create_openapi_template(route, component_name)
+                self._create_openapi_template(route, component_name, tags=route_tags)
             elif route_type == MCPType.EXCLUDE:
                 logger.info(f"Excluding route: {route.method} {route.path}")
 
         logger.info(f"Created FastMCP OpenAPI server with {len(http_routes)} routes")
 
     def _generate_default_name(
-        self, route: openapi.HTTPRoute, mcp_type: MCPType
+        self, route: openapi.HTTPRoute, mcp_names_map: dict[str, str] | None = None
     ) -> str:
         """Generate a default name from the route using the configured strategy."""
         name = ""
+        mcp_names_map = mcp_names_map or {}
 
         # First check if there's a custom mapping for this operationId
         if route.operation_id:
-            if route.operation_id in self._mcp_names:
-                name = self._mcp_names[route.operation_id]
+            if route.operation_id in mcp_names_map:
+                name = mcp_names_map[route.operation_id]
             else:
                 # If there's a double underscore in the operationId, use the first part
                 name = route.operation_id.split("__")[0]
@@ -821,9 +883,19 @@ class FastMCPOpenAPI(FastMCP):
 
         return new_name
 
-    def _create_openapi_tool(self, route: openapi.HTTPRoute, name: str):
+    def _create_openapi_tool(
+        self,
+        route: openapi.HTTPRoute,
+        name: str,
+        tags: set[str],
+    ):
         """Creates and registers an OpenAPITool with enhanced description."""
         combined_schema = _combine_schemas(route)
+
+        # Extract output schema from OpenAPI responses
+        output_schema = extract_output_schema_from_responses(
+            route.responses, route.schema_definitions
+        )
 
         # Get a unique tool name
         tool_name = self._get_unique_name(name, "tool")
@@ -848,7 +920,8 @@ class FastMCPOpenAPI(FastMCP):
             name=tool_name,
             description=enhanced_description,
             parameters=combined_schema,
-            tags=set(route.tags or []),
+            output_schema=output_schema,
+            tags=set(route.tags or []) | tags,
             timeout=self._timeout,
         )
 
@@ -863,13 +936,21 @@ class FastMCPOpenAPI(FastMCP):
                     f"Using component as-is."
                 )
 
+        # Use the potentially modified tool name as the registration key
+        final_tool_name = tool.name
+
         # Register the tool by directly assigning to the tools dictionary
-        self._tool_manager._tools[tool_name] = tool
+        self._tool_manager._tools[final_tool_name] = tool
         logger.debug(
-            f"Registered TOOL: {tool_name} ({route.method} {route.path}) with tags: {route.tags}"
+            f"Registered TOOL: {final_tool_name} ({route.method} {route.path}) with tags: {route.tags}"
         )
 
-    def _create_openapi_resource(self, route: openapi.HTTPRoute, name: str):
+    def _create_openapi_resource(
+        self,
+        route: openapi.HTTPRoute,
+        name: str,
+        tags: set[str],
+    ):
         """Creates and registers an OpenAPIResource with enhanced description."""
         # Get a unique resource name
         resource_name = self._get_unique_name(name, "resource")
@@ -893,7 +974,7 @@ class FastMCPOpenAPI(FastMCP):
             uri=resource_uri,
             name=resource_name,
             description=enhanced_description,
-            tags=set(route.tags or []),
+            tags=set(route.tags or []) | tags,
             timeout=self._timeout,
         )
 
@@ -908,13 +989,21 @@ class FastMCPOpenAPI(FastMCP):
                     f"Using component as-is."
                 )
 
+        # Use the potentially modified resource URI as the registration key
+        final_resource_uri = str(resource.uri)
+
         # Register the resource by directly assigning to the resources dictionary
-        self._resource_manager._resources[str(resource.uri)] = resource
+        self._resource_manager._resources[final_resource_uri] = resource
         logger.debug(
-            f"Registered RESOURCE: {resource_uri} ({route.method} {route.path}) with tags: {route.tags}"
+            f"Registered RESOURCE: {final_resource_uri} ({route.method} {route.path}) with tags: {route.tags}"
         )
 
-    def _create_openapi_template(self, route: openapi.HTTPRoute, name: str):
+    def _create_openapi_template(
+        self,
+        route: openapi.HTTPRoute,
+        name: str,
+        tags: set[str],
+    ):
         """Creates and registers an OpenAPIResourceTemplate with enhanced description."""
         # Get a unique template name
         template_name = self._get_unique_name(name, "resource_template")
@@ -967,7 +1056,7 @@ class FastMCPOpenAPI(FastMCP):
             name=template_name,
             description=enhanced_description,
             parameters=template_params_schema,
-            tags=set(route.tags or []),
+            tags=set(route.tags or []) | tags,
             timeout=self._timeout,
         )
 
@@ -982,8 +1071,11 @@ class FastMCPOpenAPI(FastMCP):
                     f"Using component as-is."
                 )
 
+        # Use the potentially modified template URI as the registration key
+        final_template_uri = template.uri_template
+
         # Register the template by directly assigning to the templates dictionary
-        self._resource_manager._templates[uri_template_str] = template
+        self._resource_manager._templates[final_template_uri] = template
         logger.debug(
-            f"Registered TEMPLATE: {uri_template_str} ({route.method} {route.path}) with tags: {route.tags}"
+            f"Registered TEMPLATE: {final_template_uri} ({route.method} {route.path}) with tags: {route.tags}"
         )

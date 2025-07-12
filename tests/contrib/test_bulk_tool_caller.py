@@ -1,7 +1,7 @@
 from typing import Any
 
 import pytest
-from mcp.types import EmbeddedResource, ImageContent, TextContent
+from mcp.types import TextContent
 
 from fastmcp import FastMCP
 from fastmcp.contrib.bulk_tool_caller.bulk_tool_caller import (
@@ -10,8 +10,6 @@ from fastmcp.contrib.bulk_tool_caller.bulk_tool_caller import (
     CallToolRequestResult,
 )
 from fastmcp.tools.tool import Tool
-
-ContentType = TextContent | ImageContent | EmbeddedResource
 
 
 class ToolException(Exception):
@@ -61,7 +59,10 @@ async def no_return_tool(arg1: str) -> None:
 def no_return_tool_result_factory(arg1: str) -> CallToolRequestResult:
     """A tool that returns a result based on the input arguments."""
     return CallToolRequestResult(
-        isError=False, content=[], tool="no_return_tool", arguments={"arg1": arg1}
+        isError=False,
+        content=[],
+        tool="no_return_tool",
+        arguments={"arg1": arg1},
     )
 
 

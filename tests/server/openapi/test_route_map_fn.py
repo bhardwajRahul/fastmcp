@@ -1,9 +1,11 @@
 """Tests for the route_map_fn and component_fn functionality in FastMCPOpenAPI."""
 
+from unittest.mock import AsyncMock
+
 import httpx
 import pytest
 
-from fastmcp.server.openapi import FastMCPOpenAPI, MCPType
+from fastmcp.server.openapi import FastMCPOpenAPI, MCPType, RouteMap, RouteMapFn
 
 
 @pytest.fixture
@@ -161,21 +163,19 @@ def test_route_map_fn_returns_none(sample_openapi_spec, http_client):
 
     # Should have default behavior
     assert server.name == "Test Server"
-    # Check that components were created with default types
+    # Check that components were created with default mapping
     tools = server._tool_manager._tools
     resources = server._resource_manager._resources
     templates = server._resource_manager._templates
 
     # Should have tools, resources, and templates based on default mapping
     assert len(tools) > 0
-    assert len(resources) > 0
-    assert len(templates) > 0
+    assert len(resources) == 0
+    assert len(templates) == 0
 
 
 def test_route_map_fn_called_for_excluded_routes(sample_openapi_spec, http_client):
     """Test that route_map_fn is called for excluded routes and can rescue them."""
-
-    from fastmcp.server.openapi import RouteMap
 
     # Exclude all admin routes
     route_maps = [
@@ -188,7 +188,7 @@ def test_route_map_fn_called_for_excluded_routes(sample_openapi_spec, http_clien
 
     def track_calls_and_rescue(route, mcp_type):
         """Track which routes the function is called for and rescue some excluded routes."""
-        called_routes.append(route.path)
+        called_routes.append((route.method, route.path))
 
         # Rescue the admin GET route by converting it to a tool
         if route.path == "/admin/settings" and route.method == "GET":
@@ -205,10 +205,11 @@ def test_route_map_fn_called_for_excluded_routes(sample_openapi_spec, http_clien
     )
 
     # route_map_fn should now be called for all routes, including excluded admin routes
-    assert "/admin/settings" in called_routes
-    assert "/users" in called_routes
-    assert "/users/{id}" in called_routes
-    assert "/api/data" in called_routes
+    assert ("GET", "/admin/settings") in called_routes
+    assert ("GET", "/users") in called_routes
+    assert ("GET", "/users/{id}") in called_routes
+    assert ("GET", "/api/data") in called_routes
+    assert ("POST", "/admin/settings") in called_routes
 
     # The rescued admin GET route should now be a tool
     tools = server._tool_manager._tools
@@ -296,7 +297,7 @@ def test_combined_route_map_fn_and_component_fn(sample_openapi_spec, http_client
 
 def test_route_map_fn_signature_validation():
     """Test that route_map_fn has the correct signature."""
-    from fastmcp.server.openapi import RouteMapFn
+
     from fastmcp.utilities import openapi
 
     # This is more of a type checking test
@@ -334,8 +335,6 @@ def test_component_fn_signature_validation():
 
 def test_route_map_fn_can_rescue_excluded_routes(sample_openapi_spec, http_client):
     """Test that route_map_fn can rescue routes that were excluded by RouteMap."""
-
-    from fastmcp.server.openapi import RouteMap
 
     # Exclude ALL routes by default
     route_maps = [
@@ -375,3 +374,79 @@ def test_route_map_fn_can_rescue_excluded_routes(sample_openapi_spec, http_clien
     assert "getAdminSettings" not in tools
     assert "updateAdminSettings" not in tools
     assert "getData" not in tools
+
+
+class TestComponentFnToolNameModificationBug:
+    """Test that mcp_component_fn can modify tool names without breaking access (Issue #1091)."""
+
+    @pytest.fixture
+    def mocked_http_client(self):
+        """Mock HTTP client that returns successful responses."""
+        from unittest.mock import MagicMock
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+
+        # Mock a successful response
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"result": "success"}
+        mock_response.raise_for_status.return_value = None
+
+        mock_client.request.return_value = mock_response
+        return mock_client
+
+    @pytest.fixture
+    def server_with_modified_tool_names(self, sample_openapi_spec, mocked_http_client):
+        """Server with tool names modified by mcp_component_fn."""
+
+        def modify_tool_names(route, component):
+            """Modify tool names by adding v1_removed_ prefix."""
+            from fastmcp.server.openapi import OpenAPITool
+
+            if isinstance(component, OpenAPITool):
+                if component.name.startswith("get"):
+                    component.name = "v1_removed_" + component.name
+
+        return FastMCPOpenAPI(
+            openapi_spec=sample_openapi_spec,
+            client=mocked_http_client,
+            name="Test Server",
+            mcp_component_fn=modify_tool_names,
+        )
+
+    def test_registration(self, server_with_modified_tool_names):
+        """Test that modified tool names are properly registered."""
+        tools = server_with_modified_tool_names._tool_manager._tools
+
+        # Tool should be registered with the modified name
+        assert "v1_removed_getUserById" in tools
+        assert "v1_removed_getAdminSettings" in tools
+        assert "v1_removed_getData" in tools
+
+        # The tool object should have the same name as the registration key
+        for key, tool in tools.items():
+            if key.startswith("v1_removed_"):
+                assert tool.name == key
+
+    async def test_client_access(self, server_with_modified_tool_names):
+        """Test that modified tool names are accessible via client."""
+        from fastmcp.client import Client
+
+        async with Client(server_with_modified_tool_names) as client:
+            # List tools to verify they are exposed correctly
+            available_tools = await client.list_tools()
+            tool_names = [tool.name for tool in available_tools]
+
+            # Verify the modified tool names are available
+            assert "v1_removed_getUserById" in tool_names
+            assert "v1_removed_getAdminSettings" in tool_names
+            assert "v1_removed_getData" in tool_names
+
+    async def test_client_call(self, server_with_modified_tool_names):
+        """Test that modified tool names can be called via client."""
+        from fastmcp.client import Client
+
+        async with Client(server_with_modified_tool_names) as client:
+            # This should work without "Unknown tool" error
+            result = await client.call_tool("v1_removed_getData", {})
+            assert result.data == {"result": "success"}
